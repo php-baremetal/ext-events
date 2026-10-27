@@ -33,7 +33,7 @@ in automatic light sleep; every third heartbeat holds it awake for about 2 s.
   },
   "extra": {
     "baremetal": {
-      "sdk": "esp32@^1.0",
+      "sdk": "esp32@^2.0",
       "board": "waveshare-esp32-s3-zero",
       "runtime": "event-driven",
       "storage": "embedded",

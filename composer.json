@@ -4,7 +4,7 @@
     "type": "bm-ext",
     "license": "MIT",
     "authors": [
-        { "name": "Gianfrancesco Aurecchia", "email": "gianfri@aurecchia.com" }
+        { "name": "Gianfrancesco Aurecchia", "email": "gianfri@php-baremetal.com" }
     ],
     "require": {
         "php": ">=8.3",

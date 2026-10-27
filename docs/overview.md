@@ -31,7 +31,7 @@ chip awake for a stretch when the `power-save` option is on.
 | --- | --- |
 | `php-baremetal/events-hal` (virtual) | The platform side: the event queue, periodic timers, GPIO interrupts, the light-sleep lock. On ESP32 it is `php-baremetal/esp32-events-hal` (platform `esp32`, over `esp_timer`, `esp_driver_gpio` and `esp_pm`). |
 
-You never require the HAL yourself. Conductor reads the platform from `extra.baremetal.sdk` (`esp32@^1.0`
+You never require the HAL yourself. Conductor reads the platform from `extra.baremetal.sdk` (`esp32@^2.0`
 gives `esp32`) and adds `php-baremetal/esp32-events-hal` while Composer resolves. The PHP module is `events`;
 it registers with priority 10, before other extensions, so `Baremetal\Event` exists when `ext-i2c` and
 `ext-web` define their event classes.
@@ -82,7 +82,7 @@ The resulting `composer.json`, for a Waveshare ESP32-S3-Zero (N8R8), whose BOOT 
   },
   "extra": {
     "baremetal": {
-      "sdk": "esp32@^1.0",
+      "sdk": "esp32@^2.0",
       "board": "waveshare-esp32-s3-zero-n8r8",
       "runtime": "event-driven",
       "storage": "embedded"
