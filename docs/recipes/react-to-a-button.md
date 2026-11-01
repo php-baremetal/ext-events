@@ -64,8 +64,9 @@ echo "press BOOT; hold it 1.5 s to reset\n";
 | Press held 1.5 s | `LongPress` while still pressed; no `Click` for that press. |
 | Tenth click | The `Click` listener dispatches a `Milestone`, delivered right away by `dispatch()`. |
 
-Add `'double' => DoubleClick::class` to `$on` and `'doubleMs' => 300` to the options for a double-click;
-every single `click` is then delayed by up to 300 ms while the sampler waits for a second one.
+Add `'double' => DoubleClick::class` to `$on` for a double-click; every single `click` is then delayed by up
+to 300 ms while the sampler waits for a second one. `'doubleMs'` changes the window (ext-events 1.0.2 and
+later; earlier versions need `'doubleMs' => 300`, or `double` never fires).
 
 ## The one-event variant
 

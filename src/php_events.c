@@ -13,6 +13,7 @@
 
 /* Baremetal\Event, Baremetal\Events and the event sources (every, watch_gpio, watch_button, power_*). */
 #include "php.h"
+#include "SAPI.h"
 #include "event_bus_php.h"
 #include "zend_exceptions.h"
 #include "zend_interfaces.h"
@@ -457,8 +458,13 @@ zend_class_entry *bm_events_base_ce(void)
     return bm_event_ce;
 }
 
+static bool bm_sources_refused(const char *fn);
+
 bool bm_events_source_tag(zend_string *class_name, uint16_t *out_tag)
 {
+    if (bm_sources_refused("poll")) {   /* throws: the caller must not throw again */
+        return false;
+    }
     int tag = bm_source_tag(class_name);
     if (tag < 0) {
         return false;
@@ -495,6 +501,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_watch_gpio, 0, 2, IS_VOID, 0)
     ZEND_ARG_TYPE_INFO(0, event, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+/* The web-server runtime serves each HTTP request as its own PHP request: nothing delivers source events there,
+   and a source would outlive the request that made it. The runtime says so for its whole run (its init script
+   included); a request being served (any SAPI) says so too. */
+static bool bm_sources_refused(const char *fn)
+{
+    if (!bm_hal_request_scoped() && SG(request_info).request_method == NULL) {
+        return false;
+    }
+    zend_throw_exception_ex(zend_ce_exception, 0,
+        "%s() is not available in the web-server runtime: event sources need the event-driven runtime", fn);
+    return true;
+}
+
 /* every(int $ms, string $event): void */
 PHP_FUNCTION(every)
 {
@@ -504,6 +523,9 @@ PHP_FUNCTION(every)
         Z_PARAM_LONG(ms)
         Z_PARAM_STR(event)
     ZEND_PARSE_PARAMETERS_END();
+    if (bm_sources_refused("every")) {
+        RETURN_THROWS();
+    }
     if (ms <= 0) {
         zend_argument_value_error(1, "must be greater than 0");
         RETURN_THROWS();
@@ -530,6 +552,9 @@ PHP_FUNCTION(watch_gpio)
         Z_PARAM_LONG(pin)
         Z_PARAM_STR(event)
     ZEND_PARSE_PARAMETERS_END();
+    if (bm_sources_refused("watch_gpio")) {
+        RETURN_THROWS();
+    }
     int tag = bm_source_tag(event);
     if (tag < 0) {
         zend_throw_exception_ex(zend_ce_exception, 0,
@@ -560,6 +585,9 @@ PHP_FUNCTION(watch_button)
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY(opts)
     ZEND_PARSE_PARAMETERS_END();
+    if (bm_sources_refused("watch_button")) {
+        RETURN_THROWS();
+    }
 
     if (bm_button_n >= BM_MAX_BUTTONS) {
         zend_throw_exception(zend_ce_exception, "watch_button(): too many buttons", 0);
@@ -606,6 +634,10 @@ PHP_FUNCTION(watch_button)
         if ((z = zend_hash_str_find(o, "debounceMs", sizeof("debounceMs") - 1))) b->debounce_ms = (int) zval_get_long(z);
         if ((z = zend_hash_str_find(o, "activeLow", sizeof("activeLow") - 1))) b->active_low = zend_is_true(z);
     }
+    /* A wired `double` without doubleMs would never fire: give it a window. An explicit 0 still turns it off. */
+    if (b->tag[BTN_DOUBLE] >= 0 && !(opts && zend_hash_str_exists(Z_ARRVAL_P(opts), "doubleMs", sizeof("doubleMs") - 1))) {
+        b->double_ms = 300;
+    }
 
     bm_hal_gpio_input((int) pin, b->active_low ? BM_HAL_PULL_UP : BM_HAL_PULL_DOWN);
     b->in_use = true;
@@ -620,6 +652,9 @@ PHP_FUNCTION(button_sampling)
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_BOOL(on)
     ZEND_PARSE_PARAMETERS_END();
+    if (bm_sources_refused("button_sampling")) {
+        RETURN_THROWS();
+    }
     if (on) {
         bm_btn_start();
     } else {
@@ -677,6 +712,21 @@ PHP_FUNCTION(power_release)
     }
 }
 
+/* The listener table and the dispatch queue live in request memory: drop them when the request ends (the
+   web-server runtime runs one request per HTTP request), and release a power_hold() left behind. */
+PHP_RSHUTDOWN_FUNCTION(events)
+{
+    if (bm_ready) {
+        zend_hash_destroy(&bm_listeners);
+        zval_ptr_dtor(&bm_pending);
+        bm_ready = false;
+    }
+    bm_frozen = false;
+    bm_draining = false;
+    bm_events_power_autorelease();
+    return SUCCESS;
+}
+
 PHP_MINIT_FUNCTION(events)
 {
     zend_class_entry ce;
@@ -714,7 +764,7 @@ zend_module_entry events_module_entry = {
     PHP_MINIT(events),
     NULL,   /* MSHUTDOWN */
     NULL,   /* RINIT */
-    NULL,   /* RSHUTDOWN */
+    PHP_RSHUTDOWN(events),
     NULL,   /* MINFO */
     "1.0",
     STANDARD_MODULE_PROPERTIES

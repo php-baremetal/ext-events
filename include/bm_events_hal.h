@@ -45,6 +45,10 @@ void bm_hal_gpio_on_falling(int pin, void (*isr)(void *arg), void *arg);
 /* Whether automatic light sleep is on (the host configured esp_pm). */
 bool bm_hal_power_save(void);
 
+/* Whether the runtime runs every HTTP request as its own PHP request (web-server): event sources make no
+ * sense there, at boot included. Since events-hal 1.1. */
+bool bm_hal_request_scoped(void);
+
 /* No-light-sleep lock; create returns NULL when power management is off. */
 typedef struct bm_hal_pmlock bm_hal_pmlock_t;
 bm_hal_pmlock_t *bm_hal_pmlock_create(const char *name);

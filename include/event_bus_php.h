@@ -47,7 +47,7 @@ bool bm_events_power_save(void);
 struct _zend_class_entry *bm_events_base_ce(void);
 
 /* False if the class is unknown or the source table is full. */
-bool bm_events_source_tag(struct _zend_string *class_name, uint16_t *out_tag);
+bool bm_events_source_tag(struct _zend_string *class_name, uint16_t *out_tag);   /* false and an exception while serving an HTTP request */
 
 /* Safe from any task; dropped when the queue is full. */
 void bm_events_emit(uint16_t tag, void *device);

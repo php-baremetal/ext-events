@@ -76,7 +76,7 @@ Timing options, all in milliseconds except `activeLow`; see the table below.
 | `debounceMs` | `30` | The level must stay changed this long before it counts. |
 | `holdMs` | `800` | Pressed this long raises `held`; a press that reaches it never raises `click`. |
 | `repeatMs` | `0` | After `held`, raise `repeat` this often while still pressed. `0` turns repeat off. |
-| `doubleMs` | `0` | A second click within this window raises `double` instead of two `click`s. `0` turns double-click detection off. |
+| `doubleMs` | `300` with `double` in `$on`, otherwise `0` | A second click within this window raises `double` instead of two `click`s. `0` turns double-click detection off. Before ext-events 1.0.2 the default was always `0`, so `double` never fired without this option. |
 | `activeLow` | `true` | `true`: pressed reads low (button to GND, pull-up). `false`: pressed reads high (button to 3.3 V, pull-down). |
 
 | Gesture | When |

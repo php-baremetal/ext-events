@@ -29,10 +29,13 @@ WebSocket frame waits up to 2 s for room.
 | --- | --- | --- | --- |
 | `event-driven` | Delivered by the reactor | Work | Frozen when the top-level script returns |
 | `init-loop` | Never delivered (sources run, the queue is never read) | Work | Never frozen |
-| `web-server` | Not supported | Not supported | Not supported |
+| `web-server` | Refused: `every()`, `watch_gpio()`, `watch_button()`, `button_sampling()` and ext-i2c `poll()` with an event throw, in a request and in the `init` script | Work, inside the request | One per request, dropped when it ends |
 
-In `web-server` every request starts with a fresh PHP state, while ext-events keeps its listener table for
-the whole run: do not use ext-events there. For HTTP with resident state, use `ext-web` in the
+In `web-server` every HTTP request is its own PHP request and nothing reads the event queue. Listeners
+registered in a request live until that request ends, so `Events::now()` and `dispatch()` work within it;
+a `power_hold()` left behind is released at the end too. Event sources would outlive the request that made
+them and never deliver, so they throw, also in the `init` script (the runtime tells ext-events through the
+events HAL, `bm_hal_request_scoped()`). For HTTP with resident state and sources, use `ext-web` in the
 `event-driven` runtime.
 
 ## The event-driven reactor

@@ -58,6 +58,7 @@ The remaining declarations (`bm_events_freeze()`, `bm_events_receive()`, `bm_eve
 | Timer | `bm_hal_timer_create()`, `bm_hal_timer_start()` (periodic, ms), `bm_hal_timer_stop()` |
 | GPIO | `bm_hal_gpio_input()` (`BM_HAL_PULL_UP` / `_DOWN` / `_NONE`), `bm_hal_gpio_level()`, `bm_hal_gpio_on_falling()` |
 | Power | `bm_hal_power_save()`, `bm_hal_pmlock_create()` (NULL when power management is off), `bm_hal_pmlock_acquire()`, `bm_hal_pmlock_release()` |
+| Runtime | `bm_hal_request_scoped()`: true when every HTTP request is its own PHP request (`web-server`), for the whole run; event sources are refused then. Interface version 1.1 |
 
 ext-events also ships `event_bus.h`, a C event core with fixed slot pools and a dispatcher (`evt_*`
 functions). The PHP API above does not use it, and no package calls it today.
