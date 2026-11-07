@@ -2,6 +2,7 @@
 
 ## 1.1.0
 
+- Added: ide/ext-events.stub, the PHP declarations of the package for IDEs (conductor copies it into vendor/php-baremetal/ide-stubs/).
 - Changed: up to 32 distinct event classes can be used by sources (was 16).
 - Added: `bm_events_emit_from_isr()`, `bm_events_emit_data()` and `bm_events_slot_data()` in the C API: emit from an interrupt, and events that carry up to 16 bytes.
 - Added: every() returns a Baremetal\Timer (a Baremetal\Source): stop(), start(), running(), setPeriod() and period(); a dropped handle leaves the timer running. C API bm_source_ops_t, bm_events_source_ce(), bm_events_source_new() and bm_events_source_rec() for packages with their own sources.

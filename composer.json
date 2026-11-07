@@ -15,6 +15,7 @@
             "module": "events",
             "priority": 10,
             "idf-requires": ["phpbm"],
+            "ide-stubs": ["ide/ext-events.stub"],
             "options": {
                 "events-small": {
                     "type": "int", "min": 8, "max": 65535, "default": 64,

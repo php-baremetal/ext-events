@@ -1,0 +1,271 @@
+<?php
+// php-baremetal/ext-events 1.1.0 — IDE helper, not loaded at runtime.
+
+namespace Baremetal {
+    /**
+     * The base class of every event: declare one subclass per kind of event.
+     *
+     * Events raised by a source are created without calling the constructor: their properties keep their
+     * declared defaults. Listeners are matched on the exact class, never on a parent class.
+     */
+    class Event
+    {
+        /**
+         * The object that raised the event (for example an ext-i2c driver for a sample event), or null.
+         *
+         * @var object|null
+         */
+        public $device = null;
+
+        /**
+         * When the event was raised, in nanoseconds on the base of hrtime(true): an int where PHP integers are
+         * 64-bit, a float where they are 32-bit. Writing it throws.
+         */
+        public readonly int|float $time;
+    }
+
+    /**
+     * An event of every(): a subclass gets $ticks, the periods that went by since the event was queued.
+     */
+    class TimerEvent extends Event
+    {
+        /**
+         * 1 plus the ticks coalesced into the event while it waited (saturating at 4294967295 with 64-bit PHP
+         * integers, 2147483647 with 32-bit ones); uninitialised in an event created with new.
+         */
+        public readonly int $ticks;
+    }
+
+    /**
+     * An event of watch_gpio(), watch_gpios() and watch_button(): a subclass gets the pin and its level.
+     */
+    class PinEvent extends Event
+    {
+        /**
+         * The GPIO number that raised the event.
+         */
+        public readonly int $pin;
+
+        /**
+         * The level read from the pin (false is low); for watch_button(), the level after debounce.
+         */
+        public readonly bool $level;
+    }
+
+    /**
+     * The event bus: listener registration, inline and breadth-first delivery, and the event counters.
+     */
+    class Events
+    {
+        /**
+         * Registers a listener for one event class; listeners of a class run in registration order.
+         *
+         * @param string $event The event class name (pass Foo::class), compared byte for byte; no inheritance.
+         * @param callable $listener Called with the event object as its only argument; returning false stops
+         *                           delivery of that event to the listeners after it.
+         * @return void
+         * @throws \TypeError When $listener is not callable.
+         * @throws \Exception When the listener table is frozen (event-driven runtime, after the top-level script
+         *                    returned).
+         */
+        public static function listen(string $event, callable $listener): void {}
+
+        /**
+         * Delivers the event breadth-first: at once when no dispatch() is in progress, otherwise in the next
+         * batch of the cascade. An exception in a listener stops the cascade: the events still queued are
+         * discarded and the exception leaves the outermost dispatch().
+         *
+         * @param Event $event The event to deliver.
+         * @return bool Whether the event was accepted: false when no small event slot is free or the cascade
+         *              would be deeper than 16 levels (counted in Events::stats()).
+         */
+        public static function dispatch(Event $event): bool {}
+
+        /**
+         * Runs the listeners of the event's class immediately, on the caller's stack, without an event slot.
+         *
+         * An exception thrown by a listener stops the chain and propagates to the caller of now().
+         *
+         * @param Event $event The event to deliver.
+         * @return void
+         * @throws \RuntimeException When called with 8 now() deliveries already nested.
+         */
+        public static function now(Event $event): void {}
+
+        /**
+         * The event counters since boot, never reset: slot pools, per-class delivered, dropped, coalesced and
+         * queued events, and the deepest dispatch() cascade and now() nesting.
+         *
+         * @return array The counters, keyed 'pools', 'classes' and 'cascade'.
+         */
+        public static function stats(): array {}
+    }
+
+    /**
+     * The handle of an event source, returned by the function that starts it; it controls the source, it is
+     * not the source, and a dropped handle leaves the source running.
+     */
+    abstract class Source
+    {
+        /**
+         * Stops the source; events already queued are still delivered. Does nothing on a stopped source.
+         *
+         * @return void
+         */
+        final public function stop(): void {}
+
+        /**
+         * Starts the source again. Does nothing on a running source; if the platform cannot restart the timer,
+         * running() stays false.
+         *
+         * @return void
+         */
+        final public function start(): void {}
+
+        /**
+         * Whether the source is running.
+         *
+         * @return bool True while the source raises events.
+         */
+        final public function running(): bool {}
+    }
+
+    /**
+     * The handle of a periodic timer started by every().
+     */
+    final class Timer extends Source
+    {
+        /**
+         * Sets the period; a running timer restarts with it, a stopped one keeps it for start().
+         *
+         * @param int|float $ms Period in milliseconds, 0.1 to 4294967295, rounded to the microsecond.
+         * @return void
+         * @throws \ValueError When $ms is below 0.1 (NaN included) or above 4294967295 (INF included).
+         * @throws \Exception When the timer cannot be restarted (it is left stopped).
+         */
+        public function setPeriod(int|float $ms): void {}
+
+        /**
+         * The period as given.
+         *
+         * @return float The period in milliseconds.
+         */
+        public function period(): float {}
+    }
+
+    /**
+     * The handle of a pin watch started by watch_gpio() or watch_gpios().
+     */
+    final class GpioWatch extends Source
+    {
+        /**
+         * The pins of the watch.
+         *
+         * @return array The GPIO numbers, as a list in the order of the call.
+         */
+        public function pins(): array {}
+    }
+
+    /**
+     * The handle of a button started by watch_button(); stop() and start() pause and resume this button only.
+     */
+    final class Button extends Source
+    {
+        /**
+         * The GPIO number of the button.
+         *
+         * @return int The GPIO number.
+         */
+        public function pin(): int {}
+    }
+}
+
+namespace {
+    /**
+     * Starts a periodic timer that raises an event each period.
+     *
+     * If the class extends Baremetal\TimerEvent, $ticks counts the periods coalesced into the event.
+     *
+     * @param int|float $ms Period in milliseconds, 0.1 to 4294967295; a float is rounded to the nearest
+     *                      microsecond, so every(1000 / 60, ...) raises 60 events per second.
+     * @param string $event The event class to raise each period, e.g. Tick::class.
+     * @param bool $coalesce true: a tick is not queued while one of this class still waits for delivery;
+     *                       false: every tick takes its own slot, and ticks without a free slot are dropped.
+     * @return \Baremetal\Timer The handle of the new timer.
+     * @throws \ValueError When $ms is below 0.1 (NaN included) or above 4294967295 (INF included).
+     * @throws \Exception When the class is unknown, the source table is full, the timer cannot start, or the
+     *                    event pools could not be allocated at boot.
+     */
+    function every(int|float $ms, string $event, bool $coalesce = true): \Baremetal\Timer {}
+
+    /**
+     * Raises an event on each falling edge of a pin, caught by an interrupt and debounced (200 ms per class).
+     *
+     * The pin becomes an input with the internal pull-up; if the class extends Baremetal\PinEvent, the event
+     * carries $pin and $level.
+     *
+     * @param int $pin GPIO number, 0 to 63.
+     * @param string $event The event class to raise on each falling edge.
+     * @param bool $coalesce true: an edge is not queued while an edge event of this class still waits;
+     *                       false: every edge takes its own slot.
+     * @return \Baremetal\GpioWatch The handle of the watch.
+     * @throws \ValueError When $pin is outside 0 to 63.
+     * @throws \Exception When the class is unknown, the source table is full, or the event pools could not be
+     *                    allocated at boot.
+     */
+    function watch_gpio(int $pin, string $event, bool $coalesce = false): \Baremetal\GpioWatch {}
+
+    /**
+     * Raises one Baremetal\PinEvent class on each falling edge of any of several pins, debounced per pin
+     * (200 ms); $pin says which one fired.
+     *
+     * @param array $pins A non-empty list of GPIO numbers, each 0 to 63.
+     * @param string $event A class that extends Baremetal\PinEvent.
+     * @param bool $coalesce true: an edge is not queued while an event of this class still waits;
+     *                       false: every edge takes its own slot.
+     * @return \Baremetal\GpioWatch One handle for all the pins.
+     * @throws \TypeError When the class does not extend Baremetal\PinEvent.
+     * @throws \ValueError When $pins is not a non-empty list of GPIO numbers.
+     * @throws \Exception When the class is unknown, the source table is full, or the event pools could not be
+     *                    allocated at boot.
+     */
+    function watch_gpios(array $pins, string $event, bool $coalesce = false): \Baremetal\GpioWatch {}
+
+    /**
+     * Watches a push button sampled every 10 ms and raises events for its gestures (at most four buttons).
+     *
+     * @param int $pin GPIO number of the button; it becomes an input with a pull-up (pull-down when activeLow
+     *                 is false).
+     * @param array $on Gesture name to event class; keys: pressed, released, held, click, repeat, double.
+     * @param array $opts Timing options in milliseconds: debounceMs (30), holdMs (800), repeatMs (0, off),
+     *                    doubleMs (300 with double in $on, otherwise 0); and activeLow (true: pressed reads low).
+     * @return \Baremetal\Button The handle of the button.
+     * @throws \Exception When four buttons are already watched, a class is unknown, the source table is full, or
+     *                    the event pools could not be allocated at boot.
+     */
+    function watch_button(int $pin, array $on, array $opts = []): \Baremetal\Button {}
+
+    /**
+     * Stops or starts the 10 ms button sampler, pausing or resuming every watched button.
+     *
+     * @param bool $on false stops the sampler (no gestures, no wake-ups from it); true starts it again.
+     * @return void
+     */
+    function button_sampling(bool $on): void {}
+
+    /**
+     * Forbids light sleep until the matching power_release(); calls nest. Does nothing without power-save.
+     *
+     * A hold still standing when the outermost event delivery ends is released.
+     *
+     * @return void
+     */
+    function power_hold(): void {}
+
+    /**
+     * Undoes the most recent power_hold() still standing; extra calls are ignored.
+     *
+     * @return void
+     */
+    function power_release(): void {}
+}
