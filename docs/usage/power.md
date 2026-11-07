@@ -50,9 +50,15 @@ Undoes one `power_hold()`. Extra calls are ignored.
 
 ## Holds end with the event
 
-In the `event-driven` runtime, any hold still standing when an event's listeners return is released, so a
-forgotten `power_release()` cannot keep the chip awake for good, and a hold never spans two events. Under
-`init-loop` there is no such release: a hold lasts until `power_release()`.
+A hold taken while an event is delivered belongs to the outermost delivery: the reactor event, or, outside
+one, the outermost `Events::dispatch()` or `Events::now()` call. When that delivery ends, the holds still
+standing are released, so a forgotten `power_release()` cannot keep the chip awake for good, and a hold never
+spans two events. A hold taken inside a nested `now()` or a dispatched event stays until the outer event ends.
+A fatal error in a listener releases every hold before the program stops. In the
+`event-driven` runtime a hold taken by the top-level script is released after the first event. Under
+`init-loop` a hold taken by `loop()` outside any delivery lasts until `power_release()`.
+
+`power_release()` undoes the most recent hold still standing.
 
 Without power-save (or on a build where power management could not start) both functions do nothing, so the
 same script runs either way.

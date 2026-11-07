@@ -1,6 +1,6 @@
 ---
 eyebrow: 'ext-events · PHP API'
-lede:    'An event is an object of a Baremetal\Event subclass. Listeners are registered per exact class; now() delivers inline, dispatch() delivers breadth-first.'
+lede:    'An event is an object of a Baremetal\Event subclass. Listeners are registered per exact class; now() delivers inline, dispatch() delivers breadth-first and says whether it took the event; stats() counts it all.'
 see_also:
   - { href: './sources.md', meta: 'PHP API' }
   - { href: '../reference/runtimes-and-delivery.md', meta: 'Reference' }
@@ -18,6 +18,7 @@ the objects, or you create them yourself and pass them to `Events::now()` or `Ev
 | Property | Type | Meaning |
 | --- | --- | --- |
 | `$device` | `?object` | The object that raised the event (for example an `ext-i2c` driver for a sample event), or `null`. |
+| `$time` | `int\|float`, readonly | When the event was raised, in nanoseconds on the base of `hrtime(true)`: an `int` where PHP integers are 64-bit, a `float` on the 32-bit board. |
 
 <!-- @code-block language="php" label="event classes" -->
 ```php
@@ -35,7 +36,9 @@ final class Milestone extends Event              // created in PHP: a constructo
 
 Events raised by a source (`every()`, `watch_gpio()`, `watch_button()`, an extension) are created without
 calling the constructor: their properties keep their declared defaults, and `$device` is set when the source
-passes an emitter.
+passes an emitter. `$time` is the moment the source raised the event (not when the listener runs), so
+`hrtime(true) - $e->time` is how long the event waited. An event you create with `new` takes its `$time` at
+the `new`; `Events::now()` and `Events::dispatch()` keep it. `$time` is readonly: writing it throws.
 
 ## Events::listen()
 
@@ -67,18 +70,25 @@ receives nothing.
 
 <!-- @method name="Events::now(Event $event): void" returns="void" visibility="public static" -->
 
-Runs the listeners of `$event`'s class immediately, on the caller's stack, and returns when they are done.
-Nested `now()` calls nest like ordinary function calls. An exception thrown by a listener stops the chain and
-propagates to the caller of `now()`.
+Runs the listeners of `$event`'s class immediately, on the caller's stack, and returns when they are done. It
+takes no event slot. Nested `now()` calls nest like ordinary function calls, up to 8: a `now()` called with 8
+`now()` deliveries already running throws `\RuntimeException` with `Events::now(): nested too deep (limit 8)`,
+to its caller. An exception thrown by a listener stops the chain and propagates to the caller of `now()`.
 
 ## Events::dispatch()
 
-<!-- @method name="Events::dispatch(Event $event): void" returns="void" visibility="public static" -->
+<!-- @method name="Events::dispatch(Event $event): bool" returns="bool" visibility="public static" -->
 
-Delivers breadth-first. When no `dispatch()` is in progress, the call delivers `$event` at once, then every
+Delivers breadth-first and returns whether the event was accepted. When no `dispatch()` is in progress, the call delivers `$event` at once, then every
 event its listeners dispatched meanwhile, batch by batch, and returns when nothing is left. A `dispatch()`
 made by a listener during that cascade only appends to the next batch, so it runs after every event of the
 current batch.
+
+Every event waiting in the cascade holds a small event slot until it is delivered. `dispatch()` returns
+`false`, throws nothing and counts the refusal in `Events::stats()` when no small slot is free (the first time
+for a class it also prints a warning), or when the event would be more than 16 levels deep in the cascade (an
+event dispatched by a listener of an event dispatched by a listener ..., counted from the event the reactor
+delivered).
 
 An exception in a listener stops the cascade: the events still queued are discarded and the exception leaves
 the outermost `dispatch()`.
@@ -112,6 +122,33 @@ Events::dispatch(new A());
 
 Use `now()` when the caller needs the listeners' effects before it continues. Use `dispatch()` to announce
 something without nesting the listeners of one event inside those of another.
+
+## Events::stats()
+
+<!-- @method name="Events::stats(): array" returns="array" visibility="public static" -->
+
+The event counters since boot, never reset: the slot pools (`size`, `in_use`, `peak`), per event class the
+events `delivered`, `dropped` and `coalesced` (and `queued`, the events of the class waiting now), and the
+deepest `dispatch()` cascade and `now()` nesting with their refusals. It works in every runtime, and `phpinfo()` shows the same figures. The full
+structure is in [Runtimes and delivery](../reference/runtimes-and-delivery.md#statistics-and-warnings).
+
+<!-- @code-block language="php" label="watch for drops" -->
+```php
+<?php
+use Baremetal\Events;
+
+final class Report extends Baremetal\Event {}
+
+Events::listen(Report::class, function (): void {
+    foreach (Events::stats()['classes'] as $class => $c) {
+        if ($c['dropped'] > 0) {
+            printf("%s: %d dropped\n", $class, $c['dropped']);
+        }
+    }
+});
+every(60000, Report::class);
+```
+<!-- @endcode-block -->
 
 ## Listener state
 

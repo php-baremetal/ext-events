@@ -44,6 +44,13 @@ watch_gpio(0, BootPressed::class);  // GPIO0 falling edge, debounced
 
 The script returns after registering; the runtime then sleeps on the queue between events.
 
+Events travel in slots allocated at boot (the `events-small`, `events-medium` and `events-large` options).
+`Events::dispatch()` returns whether it took the event, a dropped event is counted per class with a warning
+at its first drop, and `Events::stats()` and `phpinfo()` show the counters.
+
+The period is in milliseconds and may be a float, down to 0.1 ms: `every(1000 / 60, Frame::class)` raises 60
+events per second.
+
 ## Documentation
 
 - [Overview](docs/overview.md): requirements, install, a first project, the API at a glance.

@@ -8,12 +8,27 @@
     ],
     "require": {
         "php": ">=8.3",
-        "php-baremetal/events-hal": "^1.1"
+        "php-baremetal/events-hal": "^1.4"
     },
     "extra": {
         "baremetal": {
             "module": "events",
-            "priority": 10
+            "priority": 10,
+            "idf-requires": ["phpbm"],
+            "options": {
+                "events-small": {
+                    "type": "int", "min": 8, "max": 65535, "default": 64,
+                    "description": "Small event slots (32 bytes each, allocated at boot): every queued event, dispatch() event, HTTP request and WebSocket frame takes one; 4 more are kept for object releases."
+                },
+                "events-medium": {
+                    "type": "int", "min": 0, "max": 65535, "default": 16,
+                    "description": "Medium event slots (256 bytes each, allocated at boot), for events with a payload."
+                },
+                "events-large": {
+                    "type": "int", "min": 0, "max": 65535, "default": 8,
+                    "description": "Large event slots (2 KB each, allocated at boot), for events with a large payload."
+                }
+            }
         }
     }
 }

@@ -11,22 +11,25 @@
    +----------------------------------------------------------------------+
 */
 
-/* Baremetal\Event, Baremetal\Events and the event sources (every, watch_gpio, watch_button, power_*). */
-#include "php.h"
-#include "SAPI.h"
-#include "event_bus_php.h"
+/* Baremetal\Event, Baremetal\Events, delivery frames, power_hold()/power_release() and the module. */
+#include "php_events_internal.h"
 #include "zend_exceptions.h"
-#include "zend_interfaces.h"
-#include "bm_events_hal.h"
+#include "ext/spl/spl_exceptions.h"
+
+#include <stdio.h>
 
 static zend_class_entry *bm_event_ce;
+static zend_class_entry *bm_timer_ce;
+static zend_class_entry *bm_pin_ce;
 static zend_class_entry *bm_events_ce;
 
-static bool     bm_ready;
-static bool     bm_frozen;
-static bool     bm_draining;
-static HashTable bm_listeners; /* class name (zend_string) -> zend_array of callables */
-static zval      bm_pending;   /* array used as a FIFO queue of dispatched events */
+static bool      bm_ready;
+static bool      bm_frozen;
+static bool      bm_draining;
+static HashTable bm_listeners;   /* class name (zend_string) -> zend_array of callables */
+
+/* Events::dispatch() FIFO: slots whose payload holds the object (one reference each). */
+static evt_t *bm_pend_head, *bm_pend_tail;
 
 static void bm_lazy_init(void)
 {
@@ -34,7 +37,6 @@ static void bm_lazy_init(void)
         return;
     }
     zend_hash_init(&bm_listeners, 8, NULL, ZVAL_PTR_DTOR, 0);
-    array_init(&bm_pending);
     bm_ready = true;
 }
 
@@ -44,7 +46,7 @@ void bm_events_freeze(void)
 }
 
 /* Exact-class listeners; a false return stops the chain. */
-static void bm_deliver(zval *event)
+void bm_deliver(zval *event)
 {
     if (!bm_ready) {
         return;
@@ -68,13 +70,195 @@ static void bm_deliver(zval *event)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* ---- power_hold / power_release: owned by the outermost delivery, released when its frame closes ---- */
+
+static bm_hal_pmlock_t *bm_pm_lock;
+static bool             bm_pm_tried;
+static bool             bm_power_save;
+static int              bm_pm_base;    /* outside any delivery */
+static int              bm_pm_outer;   /* during a delivery: the outermost frame's */
+static bool             bm_pm_cascade; /* a dispatch() cascade started outside any frame owns bm_pm_outer */
+
+static void bm_pm_ensure(void)
+{
+    if (!bm_pm_tried) {
+        bm_pm_tried = true;
+        /* NULL when power management is off: hold/release become no-ops */
+        bm_pm_lock = bm_hal_pmlock_create("php_hold");
+    }
+}
+
+static void bm_pm_drop(int *count)
+{
+    while (*count > 0) {
+        bm_hal_pmlock_release(bm_pm_lock);
+        (*count)--;
+    }
+}
+
+static void bm_frame_closed(int index, void *ctx)
+{
+    (void) ctx;
+    if (index == 0 && !bm_pm_cascade) {
+        bm_pm_drop(&bm_pm_outer);
+    }
+}
+
+void bm_events_power_autorelease(void)
+{
+    bm_pm_drop(&bm_pm_base);
+    bm_pm_drop(&bm_pm_outer);
+}
+
+bool bm_events_power_save(void)
+{
+    return bm_power_save;
+}
+
+/* power_hold(): void -- until power_release() or the end of the outermost delivery (the reactor event, or
+   the outermost dispatch()/now() call), also when taken inside a nested one */
+PHP_FUNCTION(power_hold)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    bm_pm_ensure();
+    if (bm_pm_lock) {
+        bm_hal_pmlock_acquire(bm_pm_lock);
+        if (evt_frame_depth() > 0) {
+            bm_pm_outer++;
+        } else {
+            bm_pm_base++;
+        }
+    }
+}
+
+/* power_release(): void -- the most recent hold */
+PHP_FUNCTION(power_release)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!bm_pm_lock) {
+        return;
+    }
+    if (evt_frame_depth() > 0 && bm_pm_outer > 0) {
+        bm_hal_pmlock_release(bm_pm_lock);
+        bm_pm_outer--;
+    } else if (bm_pm_base > 0) {
+        bm_hal_pmlock_release(bm_pm_lock);
+        bm_pm_base--;
+    }
+}
+
+/* ---- frames and bailout ---- */
+
+/* Gives back the slots of the events still waiting in the dispatch() FIFO; the objects too, unless the
+   program is bailing out (no destructor runs then). */
+static void bm_pending_discard(bool release_objects)
+{
+    while (bm_pend_head) {
+        evt_t *e = bm_pend_head;
+        bm_payload_t *p = e->payload;
+        bm_pend_head = p->next;
+        if (!bm_pend_head) {
+            bm_pend_tail = NULL;   /* before the release: a destructor that dispatches starts a new list, */
+        }                          /* which this loop then discards too */
+        zend_object *obj = p->ptr;
+        evt_pool_release(e);
+        if (release_objects) {
+            OBJ_RELEASE(obj);
+        }
+    }
+    bm_slot_freed();
+}
+
+/* A fatal error (zend_bailout) inside a delivery: the program stops. Close the frames opened since `base`
+   (their slots and holds go back), drop the waiting events and every hold, then let the bailout go on. */
+static ZEND_NORETURN void bm_bailout(int base)
+{
+    evt_frames_unwind_to(base);
+    bm_pending_discard(false);
+    bm_draining = false;
+    bm_pm_cascade = false;
+    bm_events_power_autorelease();
+    bm_slot_freed();
+    zend_bailout();
+}
+
+static void bm_deliver_zv(void *arg)
+{
+    bm_deliver(arg);
+}
+
+/* fn(arg) with the frames opened since `base` closed on a bailout. Its own function: no caller local is
+   live across the setjmp. */
+static void bm_guarded(void (*fn)(void *arg), void *arg, int base)
+{
+    zend_try {
+        fn(arg);
+    } zend_catch {
+        bm_bailout(base);
+    } zend_end_try();
+}
+
+bool bm_run_frame(evt_t *e, void (*fn)(void *arg), void *arg)
+{
+    int base = evt_frame_depth();
+    if (!evt_frame_open(EVT_FRAME_DISPATCH, e)) {
+        evt_pool_release(e);
+        bm_slot_freed();
+        return false;
+    }
+    bm_guarded(fn, arg, base);
+    evt_frame_close();
+    bm_slot_freed();
+    return true;
+}
+
+/* Breadth-first, in the call that started it; an exception drops what still waits. Started outside any
+   frame, the whole cascade is one delivery for the power holds: each event has its own frame 0. */
+static void bm_drain(void)
+{
+    bool outermost = evt_frame_depth() == 0;
+    bm_pm_cascade = outermost;
+    bm_draining = true;
+    while (bm_pend_head && !EG(exception)) {
+        evt_t *e = bm_pend_head;
+        bm_payload_t *p = e->payload;
+        bm_pend_head = p->next;
+        if (!bm_pend_head) {
+            bm_pend_tail = NULL;
+        }
+        zend_object *obj = p->ptr;
+        zval event;
+        ZVAL_OBJ(&event, obj);
+        evt_pool_mark_delivered(e);
+        bm_run_frame(e, bm_deliver_zv, &event);
+        OBJ_RELEASE(obj);
+    }
+    if (bm_pend_head) {
+        bm_pending_discard(true);
+    }
+    bm_draining = false;
+    if (outermost) {
+        bm_pm_cascade = false;
+        bm_pm_drop(&bm_pm_outer);
+    }
+}
+
+/* ---- Events ---- */
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_events_listen, 0, 2, IS_VOID, 0)
     ZEND_ARG_TYPE_INFO(0, event, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, listener, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_events_event, 0, 1, IS_VOID, 0)
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_events_now, 0, 1, IS_VOID, 0)
     ZEND_ARG_OBJ_INFO(0, event, Baremetal\\Event, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_events_dispatch, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_OBJ_INFO(0, event, Baremetal\\Event, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_events_stats, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
 /* Events::listen(string $event, callable $listener): void */
@@ -108,17 +292,30 @@ PHP_METHOD(Events, listen)
     add_next_index_zval(list, cb);
 }
 
-/* Events::now(Event $event): void */
+/* Events::now(Event $event): void -- the listeners now, without a slot; at most 8 nested */
 PHP_METHOD(Events, now)
 {
     zval *event;
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_OBJECT_OF_CLASS(event, bm_event_ce)
     ZEND_PARSE_PARAMETERS_END();
-    bm_deliver(event);
+
+    int base = evt_frame_depth();
+    /* Refused at 8 nested now(); a full frame stack (16) is unreachable today (reactor + drain + 8 now frames
+       at most, drains never nest), so it shares the message. */
+    if (!evt_frame_open(EVT_FRAME_NOW, NULL)) {
+        zend_throw_exception_ex(spl_ce_RuntimeException, 0, "Events::now(): nested too deep (limit %d)",
+                                EVT_NOW_DEPTH_MAX);
+        RETURN_THROWS();
+    }
+    evt_t counted = { .tag = bm_class_tag(Z_OBJCE_P(event)->name, false) };
+    evt_pool_mark_delivered(&counted);
+    bm_guarded(bm_deliver_zv, event, base);
+    evt_frame_close();
 }
 
-/* Events::dispatch(Event $event): void -- breadth-first, never re-entrant */
+/* Events::dispatch(Event $event): bool -- breadth-first, in this call or in the drain already running;
+   false (counted) when no small slot is free or beyond 16 levels of cascade */
 PHP_METHOD(Events, dispatch)
 {
     zval *event;
@@ -127,295 +324,46 @@ PHP_METHOD(Events, dispatch)
     ZEND_PARSE_PARAMETERS_END();
 
     bm_lazy_init();
-    Z_TRY_ADDREF_P(event);
-    add_next_index_zval(&bm_pending, event);
-    if (bm_draining) {
-        return;
+    if (!bm_pools_ok) {
+        RETURN_FALSE;
     }
-    bm_draining = true;
-    while (zend_hash_num_elements(Z_ARRVAL(bm_pending)) > 0) {
-        zval batch = bm_pending;
-        array_init(&bm_pending);
-        zval *ev;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL(batch), ev) {
-            bm_deliver(ev);
-            if (EG(exception)) {
-                break;
-            }
-        } ZEND_HASH_FOREACH_END();
-        zval_ptr_dtor(&batch);
+    uint16_t tag = bm_class_tag(Z_OBJCE_P(event)->name, false);
+    evt_t *e = evt_pool_acquire(EVT_CLASS_TINY, tag);
+    if (!e) {
+        bm_warn_class_drop(tag);
+        RETURN_FALSE;
     }
-    bm_draining = false;
+    if (!evt_dispatch_prepare(e)) {
+        evt_pool_release(e);
+        bm_warn_cascade();
+        RETURN_FALSE;
+    }
+    e->kind = BM_EVT_DISPATCH;
+    bm_payload_t *p = e->payload;
+    p->ptr = Z_OBJ_P(event);
+    p->next = NULL;
+    GC_ADDREF(Z_OBJ_P(event));
+    if (bm_pend_tail) {
+        ((bm_payload_t *) bm_pend_tail->payload)->next = e;
+    } else {
+        bm_pend_head = e;
+    }
+    bm_pend_tail = e;
+    if (!bm_draining) {
+        bm_drain();
+    }
+    RETURN_TRUE;
 }
 
 static const zend_function_entry events_methods[] = {
-    PHP_ME(Events, listen,   arginfo_events_listen, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Events, dispatch, arginfo_events_event,  ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Events, now,      arginfo_events_event,  ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Events, listen,   arginfo_events_listen,   ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Events, dispatch, arginfo_events_dispatch, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Events, now,      arginfo_events_now,      ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Events, stats,    arginfo_events_stats,    ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
 
-/* ---- Reactor queue and sources ---- */
-
-#define BM_MAX_SOURCES 16
-#define BM_QUEUE_DEPTH 32
-#define BM_GPIO_DEBOUNCE_US 200000   /* 200 ms */
-
-static bm_hal_queue_t   *bm_queue;
-static zend_class_entry *bm_source_ce[BM_MAX_SOURCES];   /* tag -> event class */
-static int               bm_source_n;
-static volatile int64_t  bm_gpio_last[BM_MAX_SOURCES];
-static void            (*bm_http_handler)(void *handle);
-static void            (*bm_ws_handler)(void *handle);
-static void            (*bm_http_release)(void *handle, int status);
-
-void bm_events_ensure_queue(void)
-{
-    if (!bm_queue) {
-        bm_queue = bm_hal_queue_create(BM_QUEUE_DEPTH, sizeof(bm_event_msg_t));
-    }
-}
-
-/* Class name -> tag, allocated on first use. -1 on failure. */
-static int bm_source_tag(zend_string *class_name)
-{
-    zend_class_entry *ce = zend_lookup_class(class_name);
-    if (!ce) {
-        return -1;
-    }
-    for (int i = 0; i < bm_source_n; i++) {
-        if (bm_source_ce[i] == ce) {
-            return i;
-        }
-    }
-    if (bm_source_n >= BM_MAX_SOURCES) {
-        return -1;
-    }
-    bm_events_ensure_queue();
-    if (!bm_queue) {
-        return -1;
-    }
-    bm_source_ce[bm_source_n] = ce;
-    return bm_source_n++;
-}
-
-static void bm_emit_tag(uint16_t tag)
-{
-    if (bm_queue) {
-        bm_event_msg_t msg = { .tag = tag };
-        bm_hal_queue_send(bm_queue, &msg, 0);   /* dropped when full */
-    }
-}
-
-static void bm_gpio_isr(void *arg)
-{
-    uint16_t tag = (uint16_t) (uintptr_t) arg;
-    int64_t now = bm_hal_now_us();
-    if (now - bm_gpio_last[tag] < BM_GPIO_DEBOUNCE_US) {
-        return;
-    }
-    bm_gpio_last[tag] = now;
-    if (bm_queue) {
-        bm_event_msg_t msg = { .tag = tag };
-        bm_hal_queue_send_isr(bm_queue, &msg);
-    }
-}
-
-static void bm_timer_cb(void *arg)
-{
-    bm_emit_tag((uint16_t) (uintptr_t) arg);
-}
-
-/* ---- Buttons: a debounced per-pin state machine run by one sampler timer ---- */
-
-#define BM_MAX_BUTTONS 4
-#define BM_BTN_TICK_MS 10
-
-enum { BTN_PRESSED, BTN_RELEASED, BTN_HELD, BTN_CLICK, BTN_REPEAT, BTN_DOUBLE, BTN_EVENTS };
-
-typedef struct {
-    bool    in_use;
-    int     pin;
-    bool    active_low;
-    int     tag[BTN_EVENTS];      /* -1: not wired */
-    int     hold_ms, repeat_ms, double_ms, debounce_ms;
-    bool    pressed;              /* debounced level */
-    int     stable_ms;
-    int64_t press_t, last_repeat, last_click;
-    bool    held_fired, click_pending;
-} bm_button_t;
-
-static bm_button_t        bm_buttons[BM_MAX_BUTTONS];
-static int                bm_button_n;
-static bm_hal_timer_t    *bm_btn_timer;
-static bool               bm_btn_running;
-
-static void bm_btn_emit(bm_button_t *b, int ev)
-{
-    if (b->tag[ev] >= 0) {
-        bm_emit_tag((uint16_t) b->tag[ev]);
-    }
-}
-
-static void bm_btn_tick(void *arg)
-{
-    (void) arg;
-    int64_t now = bm_hal_now_us();
-    for (int i = 0; i < bm_button_n; i++) {
-        bm_button_t *b = &bm_buttons[i];
-        if (!b->in_use) {
-            continue;
-        }
-        int lvl = bm_hal_gpio_level(b->pin);
-        bool raw = b->active_low ? (lvl == 0) : (lvl != 0);
-
-        if (raw == b->pressed) {
-            b->stable_ms = 0;
-        } else {
-            b->stable_ms += BM_BTN_TICK_MS;
-            if (b->stable_ms >= b->debounce_ms) {
-                b->pressed = raw;
-                b->stable_ms = 0;
-                if (raw) {
-                    bm_btn_emit(b, BTN_PRESSED);
-                    b->press_t = now;
-                    b->held_fired = false;
-                    b->last_repeat = now;
-                } else {
-                    bm_btn_emit(b, BTN_RELEASED);
-                    if (!b->held_fired && (now - b->press_t) < (int64_t) b->hold_ms * 1000) {
-                        if (b->double_ms > 0) {
-                            if (b->click_pending && (now - b->last_click) < (int64_t) b->double_ms * 1000) {
-                                bm_btn_emit(b, BTN_DOUBLE);
-                                b->click_pending = false;
-                            } else {
-                                b->click_pending = true;
-                                b->last_click = now;
-                            }
-                        } else {
-                            bm_btn_emit(b, BTN_CLICK);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (b->pressed) {
-            if (!b->held_fired && (now - b->press_t) >= (int64_t) b->hold_ms * 1000) {
-                bm_btn_emit(b, BTN_HELD);
-                b->held_fired = true;
-                b->last_repeat = now;
-            } else if (b->held_fired && b->repeat_ms > 0 &&
-                       (now - b->last_repeat) >= (int64_t) b->repeat_ms * 1000) {
-                bm_btn_emit(b, BTN_REPEAT);
-                b->last_repeat = now;
-            }
-        }
-        if (b->click_pending && (now - b->last_click) >= (int64_t) b->double_ms * 1000) {
-            bm_btn_emit(b, BTN_CLICK);                        /* no second click */
-            b->click_pending = false;
-        }
-    }
-}
-
-static void bm_btn_start(void)
-{
-    if (!bm_btn_timer) {
-        bm_btn_timer = bm_hal_timer_create(bm_btn_tick, NULL, "buttons");
-        if (!bm_btn_timer) {
-            return;
-        }
-    }
-    if (!bm_btn_running) {
-        bm_hal_timer_start(bm_btn_timer, BM_BTN_TICK_MS);
-        bm_btn_running = true;
-    }
-}
-
-static void bm_btn_stop(void)
-{
-    if (bm_btn_timer && bm_btn_running) {
-        bm_hal_timer_stop(bm_btn_timer);
-        bm_btn_running = false;
-    }
-}
-
-bool bm_events_receive(bm_event_msg_t *out, uint32_t ms)
-{
-    if (!bm_queue) {
-        return false;
-    }
-    return bm_hal_queue_receive(bm_queue, out, ms);
-}
-
-void bm_events_deliver_msg(const bm_event_msg_t *msg)
-{
-    if (msg->kind == BM_EVT_HTTP) {
-        if (bm_http_handler) {
-            bm_http_handler(msg->ptr);
-        } else if (bm_http_release) {
-            bm_http_release(msg->ptr, 503);           /* the server task waits on this request */
-        }
-        return;
-    }
-    if (msg->kind == BM_EVT_RELEASE) {
-        OBJ_RELEASE((zend_object *) msg->ptr);
-        return;
-    }
-    if (msg->kind == BM_EVT_WS) {
-        if (bm_ws_handler) {
-            bm_ws_handler(msg->ptr);
-        } else {
-            free(msg->ptr);                           /* a malloc'd ws_msg_t nobody will take */
-        }
-        return;
-    }
-    if (msg->tag >= bm_source_n) {
-        return;
-    }
-    zval event;
-    object_init_ex(&event, bm_source_ce[msg->tag]);
-    if (msg->ptr) {                                   /* $e->device */
-        zval zdev;
-        ZVAL_OBJ(&zdev, (zend_object *) msg->ptr);
-        zend_update_property(bm_source_ce[msg->tag], Z_OBJ(event), "device", sizeof("device") - 1, &zdev);
-    }
-    bm_deliver(&event);
-    zval_ptr_dtor(&event);
-}
-
-void bm_events_set_http_handler(void (*fn)(void *handle))
-{
-    bm_http_handler = fn;
-}
-
-void bm_events_set_http_release(void (*fn)(void *handle, int status))
-{
-    bm_http_release = fn;
-}
-
-bool bm_events_post_http(void *handle)
-{
-    if (!bm_queue) {
-        return false;
-    }
-    bm_event_msg_t msg = { .tag = 0, .kind = BM_EVT_HTTP, .ptr = handle };
-    return bm_hal_queue_send(bm_queue, &msg, 0);
-}
-
-void bm_events_set_ws_handler(void (*fn)(void *handle))
-{
-    bm_ws_handler = fn;
-}
-
-bool bm_events_post_ws(void *handle, uint32_t wait_ms)
-{
-    if (!bm_queue) {
-        return false;
-    }
-    bm_event_msg_t msg = { .tag = 0, .kind = BM_EVT_WS, .ptr = handle };
-    return bm_hal_queue_send(bm_queue, &msg, wait_ms);
-}
+/* ---- C API for other extensions ---- */
 
 void bm_events_deliver_object(zval *event)
 {
@@ -458,271 +406,186 @@ zend_class_entry *bm_events_base_ce(void)
     return bm_event_ce;
 }
 
-static bool bm_sources_refused(const char *fn);
-
-bool bm_events_source_tag(zend_string *class_name, uint16_t *out_tag)
+zend_class_entry *bm_events_timer_ce(void)
 {
-    if (bm_sources_refused("poll")) {   /* throws: the caller must not throw again */
-        return false;
-    }
-    int tag = bm_source_tag(class_name);
-    if (tag < 0) {
-        return false;
-    }
-    *out_tag = (uint16_t) tag;
-    return true;
+    return bm_timer_ce;
 }
 
-void bm_events_emit(uint16_t tag, void *device)
+zend_class_entry *bm_events_pin_ce(void)
 {
-    if (bm_queue) {
-        bm_event_msg_t msg = { .tag = tag, .kind = BM_EVT_SOURCE, .ptr = device };
-        bm_hal_queue_send(bm_queue, &msg, 0);   /* dropped when full */
-    }
+    return bm_pin_ce;
 }
 
-void bm_events_release_later(zend_object *obj)
+/* ---- $time, readonly payload properties ---- */
+
+/* Property infos found once per (class, name): a small cache, emptied at request end because user classes (and
+   their infos) are freed then. Internal classes are looked up again after that, which is cheap. */
+#define BM_PROP_CACHE 16
+static struct { zend_class_entry *ce; zend_property_info *info; } bm_prop_cache[BM_PROP_CACHE];
+static int bm_prop_cache_n;
+
+static void bm_prop_cache_reset(void)
 {
-    if (!bm_queue) {
-        OBJ_RELEASE(obj);                             /* nothing can have been queued */
-        return;
-    }
-    bm_event_msg_t msg = { .tag = 0, .kind = BM_EVT_RELEASE, .ptr = obj };
-    bm_hal_queue_send(bm_queue, &msg, 0);             /* full: the reference is kept, never freed early */
+    memset(bm_prop_cache, 0, sizeof bm_prop_cache);
+    bm_prop_cache_n = 0;
 }
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_every, 0, 2, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, ms, IS_LONG, 0)
-    ZEND_ARG_TYPE_INFO(0, event, IS_STRING, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_watch_gpio, 0, 2, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, pin, IS_LONG, 0)
-    ZEND_ARG_TYPE_INFO(0, event, IS_STRING, 0)
-ZEND_END_ARG_INFO()
-
-/* The web-server runtime serves each HTTP request as its own PHP request: nothing delivers source events there,
-   and a source would outlive the request that made it. The runtime says so for its whole run (its init script
-   included); a request being served (any SAPI) says so too. */
-static bool bm_sources_refused(const char *fn)
+static zend_property_info *bm_prop_info(zend_class_entry *ce, const char *name)
 {
-    if (!bm_hal_request_scoped() && SG(request_info).request_method == NULL) {
-        return false;
-    }
-    zend_throw_exception_ex(zend_ce_exception, 0,
-        "%s() is not available in the web-server runtime: event sources need the event-driven runtime", fn);
-    return true;
-}
-
-/* every(int $ms, string $event): void */
-PHP_FUNCTION(every)
-{
-    zend_long ms;
-    zend_string *event;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_LONG(ms)
-        Z_PARAM_STR(event)
-    ZEND_PARSE_PARAMETERS_END();
-    if (bm_sources_refused("every")) {
-        RETURN_THROWS();
-    }
-    if (ms <= 0) {
-        zend_argument_value_error(1, "must be greater than 0");
-        RETURN_THROWS();
-    }
-    int tag = bm_source_tag(event);
-    if (tag < 0) {
-        zend_throw_exception_ex(zend_ce_exception, 0, "every(): unknown class '%s' or too many sources",
-                                ZSTR_VAL(event));
-        RETURN_THROWS();
-    }
-    bm_hal_timer_t *h = bm_hal_timer_create(bm_timer_cb, (void *) (uintptr_t) tag, "every");
-    if (!h || !bm_hal_timer_start(h, (uint32_t) ms)) {
-        zend_throw_exception(zend_ce_exception, "every(): cannot start the timer", 0);
-        RETURN_THROWS();
-    }
-}
-
-/* watch_gpio(int $pin, string $event): void -- falling edge, debounced */
-PHP_FUNCTION(watch_gpio)
-{
-    zend_long pin;
-    zend_string *event;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_LONG(pin)
-        Z_PARAM_STR(event)
-    ZEND_PARSE_PARAMETERS_END();
-    if (bm_sources_refused("watch_gpio")) {
-        RETURN_THROWS();
-    }
-    int tag = bm_source_tag(event);
-    if (tag < 0) {
-        zend_throw_exception_ex(zend_ce_exception, 0,
-                                "watch_gpio(): unknown class '%s' or too many sources", ZSTR_VAL(event));
-        RETURN_THROWS();
-    }
-    bm_hal_gpio_on_falling((int) pin, bm_gpio_isr, (void *) (uintptr_t) tag);
-}
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_watch_button, 0, 2, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, pin, IS_LONG, 0)
-    ZEND_ARG_TYPE_INFO(0, on, IS_ARRAY, 0)
-    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, opts, IS_ARRAY, 0, "[]")
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_button_sampling, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 0)
-ZEND_END_ARG_INFO()
-
-/* watch_button(int $pin, array $on, array $opts = []): void */
-PHP_FUNCTION(watch_button)
-{
-    zend_long pin;
-    zval *on, *opts = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 3)
-        Z_PARAM_LONG(pin)
-        Z_PARAM_ARRAY(on)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_ARRAY(opts)
-    ZEND_PARSE_PARAMETERS_END();
-    if (bm_sources_refused("watch_button")) {
-        RETURN_THROWS();
-    }
-
-    if (bm_button_n >= BM_MAX_BUTTONS) {
-        zend_throw_exception(zend_ce_exception, "watch_button(): too many buttons", 0);
-        RETURN_THROWS();
-    }
-    bm_button_t *b = &bm_buttons[bm_button_n];
-    memset(b, 0, sizeof(*b));
-    b->pin = (int) pin;
-    b->active_low = true;
-    b->hold_ms = 800;
-    b->debounce_ms = 30;
-    for (int i = 0; i < BTN_EVENTS; i++) {
-        b->tag[i] = -1;
-    }
-
-    static const struct { const char *k; size_t n; int ev; } gestures[] = {
-        { "pressed", sizeof("pressed") - 1, BTN_PRESSED },
-        { "released", sizeof("released") - 1, BTN_RELEASED },
-        { "held", sizeof("held") - 1, BTN_HELD },
-        { "click", sizeof("click") - 1, BTN_CLICK },
-        { "repeat", sizeof("repeat") - 1, BTN_REPEAT },
-        { "double", sizeof("double") - 1, BTN_DOUBLE },
-    };
-    HashTable *ht = Z_ARRVAL_P(on);
-    for (size_t g = 0; g < sizeof(gestures) / sizeof(gestures[0]); g++) {
-        zval *z = zend_hash_str_find(ht, gestures[g].k, gestures[g].n);
-        if (z && Z_TYPE_P(z) == IS_STRING) {
-            int tag = bm_source_tag(Z_STR_P(z));
-            if (tag < 0) {
-                zend_throw_exception_ex(zend_ce_exception, 0,
-                    "watch_button(): unknown class '%s' or too many sources", Z_STRVAL_P(z));
-                RETURN_THROWS();
-            }
-            b->tag[gestures[g].ev] = tag;
+    for (int i = 0; i < bm_prop_cache_n; i++) {
+        if (bm_prop_cache[i].ce == ce && strcmp(ZSTR_VAL(bm_prop_cache[i].info->name), name) == 0) {
+            return bm_prop_cache[i].info;
         }
     }
-
-    if (opts) {
-        HashTable *o = Z_ARRVAL_P(opts);
-        zval *z;
-        if ((z = zend_hash_str_find(o, "holdMs", sizeof("holdMs") - 1))) b->hold_ms = (int) zval_get_long(z);
-        if ((z = zend_hash_str_find(o, "repeatMs", sizeof("repeatMs") - 1))) b->repeat_ms = (int) zval_get_long(z);
-        if ((z = zend_hash_str_find(o, "doubleMs", sizeof("doubleMs") - 1))) b->double_ms = (int) zval_get_long(z);
-        if ((z = zend_hash_str_find(o, "debounceMs", sizeof("debounceMs") - 1))) b->debounce_ms = (int) zval_get_long(z);
-        if ((z = zend_hash_str_find(o, "activeLow", sizeof("activeLow") - 1))) b->active_low = zend_is_true(z);
+    zend_property_info *info = zend_hash_str_find_ptr(&ce->properties_info, name, strlen(name));
+    if (!info || (info->flags & ZEND_ACC_STATIC)) {
+        return NULL;
     }
-    /* A wired `double` without doubleMs would never fire: give it a window. An explicit 0 still turns it off. */
-    if (b->tag[BTN_DOUBLE] >= 0 && !(opts && zend_hash_str_exists(Z_ARRVAL_P(opts), "doubleMs", sizeof("doubleMs") - 1))) {
-        b->double_ms = 300;
+    if (bm_prop_cache_n < BM_PROP_CACHE) {
+        bm_prop_cache[bm_prop_cache_n].ce = ce;
+        bm_prop_cache[bm_prop_cache_n].info = info;
+        bm_prop_cache_n++;
     }
-
-    bm_hal_gpio_input((int) pin, b->active_low ? BM_HAL_PULL_UP : BM_HAL_PULL_DOWN);
-    b->in_use = true;
-    bm_button_n++;
-    bm_btn_start();
+    return info;
 }
 
-/* button_sampling(bool $on): void */
-PHP_FUNCTION(button_sampling)
+/* The slot of a property whose declared type accepts one of the MAY_BE_* bits in `mask` (or that is untyped);
+   NULL otherwise. */
+static zval *bm_prop_slot(zend_object *obj, zend_class_entry *ce, const char *name, uint32_t mask)
 {
-    zend_bool on;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_BOOL(on)
-    ZEND_PARSE_PARAMETERS_END();
-    if (bm_sources_refused("button_sampling")) {
-        RETURN_THROWS();
+    zend_property_info *info = bm_prop_info(ce, name);
+    ZEND_ASSERT(instanceof_function(obj->ce, ce));
+    if (!info || (ZEND_TYPE_IS_SET(info->type) && !(ZEND_TYPE_PURE_MASK(info->type) & mask))) {
+        return NULL;
     }
-    if (on) {
-        bm_btn_start();
-    } else {
-        bm_btn_stop();
+    zval *slot = OBJ_PROP(obj, info->offset);
+    if (Z_TYPE_P(slot) != IS_UNDEF) {
+        zval_ptr_dtor(slot);
     }
+    return slot;
 }
 
-/* ---- power_hold / power_release ---- */
-
-static bm_hal_pmlock_t     *bm_pm_lock;
-static int                  bm_pm_held;
-static bool                 bm_pm_tried;
-static bool                 bm_power_save;
-
-static void bm_pm_ensure(void)
+bool bm_event_set_prop_long(zend_object *obj, zend_class_entry *ce, const char *name, zend_long v)
 {
-    if (!bm_pm_tried) {
-        bm_pm_tried = true;
-        /* NULL when power management is off: hold/release become no-ops */
-        bm_pm_lock = bm_hal_pmlock_create("php_hold");
+    zval *slot = bm_prop_slot(obj, ce, name, MAY_BE_LONG);
+    if (!slot) {
+        return false;
     }
+    ZVAL_LONG(slot, v);
+    return true;
 }
 
-void bm_events_power_autorelease(void)
+bool bm_event_set_prop_bool(zend_object *obj, zend_class_entry *ce, const char *name, bool v)
 {
-    while (bm_pm_lock && bm_pm_held > 0) {
-        bm_hal_pmlock_release(bm_pm_lock);
-        bm_pm_held--;
+    zval *slot = bm_prop_slot(obj, ce, name, v ? MAY_BE_TRUE : MAY_BE_FALSE);
+    if (!slot) {
+        return false;
     }
+    ZVAL_BOOL(slot, v);
+    return true;
 }
 
-bool bm_events_power_save(void)        { return bm_power_save; }
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_power_void, 0, 0, IS_VOID, 0)
-ZEND_END_ARG_INFO()
-
-/* power_hold(): void -- until power_release() or the end of the handler */
-PHP_FUNCTION(power_hold)
+bool bm_event_set_prop_double(zend_object *obj, zend_class_entry *ce, const char *name, double v)
 {
-    ZEND_PARSE_PARAMETERS_NONE();
-    bm_pm_ensure();
-    if (bm_pm_lock) {
-        bm_hal_pmlock_acquire(bm_pm_lock);
-        bm_pm_held++;
+    zval *slot = bm_prop_slot(obj, ce, name, MAY_BE_DOUBLE);
+    if (!slot) {
+        return false;
     }
+    ZVAL_DOUBLE(slot, v);
+    return true;
 }
 
-/* power_release(): void */
-PHP_FUNCTION(power_release)
+bool bm_events_set_long(zend_object *event, zend_class_entry *ce, const char *name, long v)
 {
-    ZEND_PARSE_PARAMETERS_NONE();
-    if (bm_pm_lock && bm_pm_held > 0) {
-        bm_hal_pmlock_release(bm_pm_lock);
-        bm_pm_held--;
-    }
+    return bm_event_set_prop_long(event, ce, name, (zend_long) v);
 }
 
-/* The listener table and the dispatch queue live in request memory: drop them when the request ends (the
-   web-server runtime runs one request per HTTP request), and release a power_hold() left behind. */
+bool bm_events_set_bool(zend_object *event, zend_class_entry *ce, const char *name, bool v)
+{
+    return bm_event_set_prop_bool(event, ce, name, v);
+}
+
+/* Whether a property of type `t` takes `v` as it is (no coercion): a type bit of the value, or an object of a
+   class the type names. */
+static bool bm_type_accepts(zend_type t, const zval *v)
+{
+    if (!ZEND_TYPE_IS_SET(t) || (ZEND_TYPE_PURE_MASK(t) & (1u << Z_TYPE_P(v)))) {
+        return true;
+    }
+    if (Z_TYPE_P(v) != IS_OBJECT || !ZEND_TYPE_IS_COMPLEX(t)) {
+        return false;
+    }
+    const zend_type *single;
+    ZEND_TYPE_FOREACH(t, single) {
+        if (ZEND_TYPE_HAS_NAME(*single)) {
+            zend_class_entry *ce = zend_lookup_class_ex(ZEND_TYPE_NAME(*single), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
+            if (ce && instanceof_function(Z_OBJCE_P(v), ce)) {
+                return true;
+            }
+        }
+    } ZEND_TYPE_FOREACH_END();
+    return false;
+}
+
+bool bm_events_set_zval(zend_object *event, zend_class_entry *ce, const char *name, zval *v)
+{
+    zend_property_info *info = bm_prop_info(ce, name);
+    ZEND_ASSERT(instanceof_function(event->ce, ce));
+    if (!info || Z_TYPE_P(v) == IS_UNDEF || Z_ISREF_P(v) || !bm_type_accepts(info->type, v)) {
+        return false;
+    }
+    zval *slot = OBJ_PROP(event, info->offset);
+    zval old;
+    ZVAL_COPY_VALUE(&old, slot);
+    ZVAL_COPY(slot, v);
+    zval_ptr_dtor(&old);   /* after the copy: v may be the old value itself */
+    return true;
+}
+
+/* Event::$time, found once at MINIT: its offset is the same in every subclass. */
+static zend_property_info *bm_time_info;
+
+void bm_event_set_time(zend_object *obj, zend_class_entry *ce, int64_t us)
+{
+    (void) ce;
+    zval *slot = OBJ_PROP(obj, bm_time_info->offset);
+    if (Z_TYPE_P(slot) != IS_UNDEF) {
+        zval_ptr_dtor(slot);
+    }
+#if SIZEOF_ZEND_LONG == 8
+    ZVAL_LONG(slot, (zend_long) (us * 1000));
+#else
+    ZVAL_DOUBLE(slot, (double) us * 1000.0);
+#endif
+}
+
+/* Every Event, also a PHP subclass and one made with `new`, starts with $time = now. */
+static zend_object *bm_event_create(zend_class_entry *ce)
+{
+    zend_object *obj = zend_objects_new(ce);
+    object_properties_init(obj, ce);
+    bm_event_set_time(obj, bm_event_ce, bm_hal_now_us());
+    return obj;
+}
+
+/* ---- module ---- */
+
+/* The listener table, the dispatch queue and the pending releases live in request memory: drop them when the
+   request ends (the web-server runtime runs one request per HTTP request), and release a power_hold() left. */
 PHP_RSHUTDOWN_FUNCTION(events)
 {
+    bm_prop_cache_reset();
+    evt_frames_unwind_to(0);
+    bm_pending_discard(false);
+    bm_release_request_end();
+    bm_classes_request_end();
     if (bm_ready) {
         zend_hash_destroy(&bm_listeners);
-        zval_ptr_dtor(&bm_pending);
         bm_ready = false;
     }
     bm_frozen = false;
     bm_draining = false;
+    bm_pm_cascade = false;
     bm_events_power_autorelease();
     return SUCCESS;
 }
@@ -737,35 +600,69 @@ PHP_MINIT_FUNCTION(events)
     INIT_NS_CLASS_ENTRY(ce, "Baremetal", "Event", NULL);
     bm_event_ce = zend_register_internal_class(&ce);
     zend_declare_property_null(bm_event_ce, "device", sizeof("device") - 1, ZEND_ACC_PUBLIC);
+    {
+        zval undef;
+        ZVAL_UNDEF(&undef);
+        bm_time_info = zend_declare_typed_property(bm_event_ce, zend_string_init_interned("time", 4, 1), &undef,
+                                    ZEND_ACC_PUBLIC | ZEND_ACC_READONLY, NULL,
+                                    (zend_type) ZEND_TYPE_INIT_MASK(MAY_BE_LONG | MAY_BE_DOUBLE));
+        bm_event_ce->create_object = bm_event_create;
+
+        /* Baremetal\TimerEvent: `ticks` is filled by every() */
+        INIT_NS_CLASS_ENTRY(ce, "Baremetal", "TimerEvent", NULL);
+        bm_timer_ce = zend_register_internal_class_ex(&ce, bm_event_ce);
+        zend_declare_typed_property(bm_timer_ce, zend_string_init_interned("ticks", 5, 1), &undef,
+                                    ZEND_ACC_PUBLIC | ZEND_ACC_READONLY, NULL,
+                                    (zend_type) ZEND_TYPE_INIT_CODE(IS_LONG, 0, 0));
+
+        /* Baremetal\PinEvent: `pin` and `level` are filled by watch_gpio(), watch_gpios() and watch_button() */
+        INIT_NS_CLASS_ENTRY(ce, "Baremetal", "PinEvent", NULL);
+        bm_pin_ce = zend_register_internal_class_ex(&ce, bm_event_ce);
+        zend_declare_typed_property(bm_pin_ce, zend_string_init_interned("pin", 3, 1), &undef,
+                                    ZEND_ACC_PUBLIC | ZEND_ACC_READONLY, NULL,
+                                    (zend_type) ZEND_TYPE_INIT_CODE(IS_LONG, 0, 0));
+        zend_declare_typed_property(bm_pin_ce, zend_string_init_interned("level", 5, 1), &undef,
+                                    ZEND_ACC_PUBLIC | ZEND_ACC_READONLY, NULL,
+                                    (zend_type) ZEND_TYPE_INIT_CODE(_IS_BOOL, 0, 0));
+    }
 
     INIT_NS_CLASS_ENTRY(ce, "Baremetal", "Events", events_methods);
     bm_events_ce = zend_register_internal_class(&ce);
 
+    bm_source_minit();
+
     bm_ready = false;
     bm_frozen = false;
     bm_draining = false;
+
+    bm_pools_ok = evt_pool_init();
+    if (!bm_pools_ok) {
+        char msg[256];
+        evt_pool_init_error(msg, sizeof msg);
+        printf("%s\n", msg);
+        fflush(stdout);
+    }
+    bm_classes_init();
+    evt_frames_on_close(bm_frame_closed, NULL);
     return SUCCESS;
 }
 
-static const zend_function_entry events_functions[] = {
-    PHP_FE(every,           arginfo_every)
-    PHP_FE(watch_gpio,      arginfo_watch_gpio)
-    PHP_FE(watch_button,    arginfo_watch_button)
-    PHP_FE(button_sampling, arginfo_button_sampling)
-    PHP_FE(power_hold,      arginfo_power_void)
-    PHP_FE(power_release,   arginfo_power_void)
-    PHP_FE_END
-};
+PHP_MSHUTDOWN_FUNCTION(events)
+{
+    bm_classes_shutdown();
+    bm_source_shutdown();
+    return SUCCESS;
+}
 
 zend_module_entry events_module_entry = {
     STANDARD_MODULE_HEADER,
     "events",
-    events_functions,
+    bm_events_functions,
     PHP_MINIT(events),
-    NULL,   /* MSHUTDOWN */
+    PHP_MSHUTDOWN(events),
     NULL,   /* RINIT */
     PHP_RSHUTDOWN(events),
-    NULL,   /* MINFO */
+    PHP_MINFO(events),
     "1.0",
     STANDARD_MODULE_PROPERTIES
 };

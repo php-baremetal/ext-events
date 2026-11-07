@@ -129,14 +129,22 @@ echo "listeners and sources registered\n";
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `Baremetal\Event` | class | Base class of every event. Property `$device`: the object that raised it, or `null`. |
+| `Baremetal\Event` | class | Base class of every event. Properties: `$device`, the object that raised it or `null`; `$time`, readonly, when it was raised in nanoseconds (`hrtime(true)` base). |
+| `Baremetal\TimerEvent` | class | Extends `Event`; `every()` fills `public readonly int $ticks` (1 plus the ticks coalesced into the event) when the class extends it (`$ticks` is filled per event class and `coalesce` value, so it is only meaningful for events raised by `every()`; another source raising the same class with the same `coalesce` value gets it too). |
+| `Baremetal\PinEvent` | class | Extends `Event`; `watch_gpio()`, `watch_gpios()` and `watch_button()` fill `public readonly int $pin` and `public readonly bool $level` when the class extends it. |
 | `Baremetal\Events::listen(string $event, callable $listener): void` | static method | Register a listener for one exact class. |
 | `Baremetal\Events::now(Event $event): void` | static method | Deliver at once, on the caller's stack. |
-| `Baremetal\Events::dispatch(Event $event): void` | static method | Deliver breadth-first: events dispatched by listeners run after the current batch. |
-| `every(int $ms, string $event): void` | function | Raise `$event` every `$ms` milliseconds. |
-| `watch_gpio(int $pin, string $event): void` | function | Raise `$event` on each falling edge of `$pin`, 200 ms debounce. |
-| `watch_button(int $pin, array $on, array $opts = []): void` | function | Raise events for button gestures: `pressed`, `released`, `held`, `click`, `repeat`, `double`. |
-| `button_sampling(bool $on): void` | function | Pause or resume the button sampler. |
+| `Baremetal\Events::dispatch(Event $event): bool` | static method | Deliver breadth-first: events dispatched by listeners run after the current batch. `false` when no event slot is free or beyond 16 levels. |
+| `Baremetal\Events::stats(): array` | static method | Slot pools, per-class counters (queued, delivered, dropped, coalesced) and cascade depths since boot. |
+| `Baremetal\Source` | abstract class | The handle of a controllable source: `stop(): void`, `start(): void`, `running(): bool` (all `final`). Cannot be constructed, cloned or serialized. |
+| `Baremetal\Timer` | final class | Extends `Source`; the handle `every()` returns: `setPeriod(int\|float $ms): void`, `period(): float`. |
+| `Baremetal\Button` | final class | Extends `Source`; the handle `watch_button()` returns: `pin(): int`. `stop()` pauses that button; a press held at `start()` is ignored until released. `button_sampling()` pauses all buttons. |
+| `Baremetal\GpioWatch` | final class | Extends `Source`; the handle `watch_gpio()` and `watch_gpios()` return: `pins(): array`. `stop()` detaches the pins it still owns; the last watch of a pin owns it. |
+| `every(int\|float $ms, string $event, bool $coalesce = true): Baremetal\Timer` | function | Raise `$event` every `$ms` milliseconds (0.1 ms or more, rounded to the microsecond; `every(1000 / 60, Frame::class)` is 60 per second); a tick waits at most once. |
+| `watch_gpio(int $pin, string $event, bool $coalesce = false): Baremetal\GpioWatch` | function | Raise `$event` on each falling edge of `$pin`, 200 ms debounce; returns the handle. |
+| `watch_gpios(array $pins, string $event, bool $coalesce = false): Baremetal\GpioWatch` | function | Like `watch_gpio()` for several pins and one `PinEvent` class, debounced per pin. |
+| `watch_button(int $pin, array $on, array $opts = []): Baremetal\Button` | function | Raise events for button gestures: `pressed`, `released`, `held`, `click`, `repeat`, `double`; returns the handle. |
+| `button_sampling(bool $on): void` | function | Pause or resume the sampler of all buttons (a button stopped through its handle stays stopped). |
 | `power_hold(): void`, `power_release(): void` | functions | Forbid or allow automatic light sleep. |
 
 Failures throw `\Exception` with a readable message, invalid arguments `\ValueError` or `\TypeError`. See
@@ -152,11 +160,15 @@ Failures throw `\Exception` with a readable message, invalid arguments `\ValueEr
 ## Notes
 
 - Sources only post to a queue. The `event-driven` runtime is what reads it: under `init-loop` the timers
-  and interrupts run but their events are never delivered. `Events::now()` and `Events::dispatch()` work in
+  and interrupts run but their events are never delivered (the runtime gives their slots back after each
+  `loop()`). `Events::now()` and `Events::dispatch()` work in
   every runtime. See [Runtimes and delivery](./reference/runtimes-and-delivery.md).
 - Listeners match the exact class: a listener on a parent class receives nothing from its subclasses.
 - In `event-driven` the listener table is frozen when the top-level script returns; `Events::listen()`
   throws from then on.
 - Events raised by a source are created without calling their constructor.
-- The queue holds 32 messages, shared by every source and extension; a source event that finds it full is
-  dropped. At most 16 distinct event classes can be used by sources.
+- Events travel in slots allocated at boot: 64 small ones by default, shared by every source, `dispatch()`
+  and the other extensions, set with the `events-small`, `events-medium` and `events-large` options. A source
+  event that finds no free slot is dropped and counted, and the first drop of a class prints a warning;
+  `Events::stats()` and `phpinfo()` show the counters. At most 32 distinct event classes can be used by
+  sources.

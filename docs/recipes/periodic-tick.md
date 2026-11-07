@@ -66,7 +66,7 @@ Events::listen(Report::class, function () use (&$count, $started): void {
         microtime(true) - $started, $count, intdiv(memory_get_usage(), 1024));
 });
 
-every(100, Fast::class);     // 10 per second
+every(100, Fast::class);     // 10 per second (a float works too: every(1000 / 60, ...) is 60 per second)
 every(5000, Report::class);  // every 5 s
 
 echo "periodic-tick: running\n";
@@ -79,7 +79,8 @@ After about five seconds the console shows a report with roughly 50 fast ticks, 
 
 - Each `every()` starts its own hardware timer. The timer callback only posts a message; the listener runs
   later, on the PHP task, when the runtime takes the message from the queue.
-- The period is kept by the timer, not by your code: a slow listener does not shift the next tick, but
-  ticks that pile up beyond the 32-message queue are dropped.
+- The period is kept by the timer, not by your code: a slow listener does not shift the next tick. While a
+  tick waits for delivery the next ones are merged into it (`every()` coalesces by default), so a slow
+  listener sees fewer ticks instead of a backlog; `Events::stats()` counts them as `coalesced`.
 - `$count` lives as long as the program: the script's variables are never reset between events.
-- To stop reacting to a timer, have the listener return early on a flag: a started timer cannot be stopped.
+- To stop the timer, keep the `Baremetal\Timer` that `every()` returns and call `stop()` (see [Controlling a source](../usage/sources.md#controlling-a-source)).
