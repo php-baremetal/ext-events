@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- Added: `bm_events_on_idle()` and `bm_events_off_idle()` in the C API: C work that runs each time the PHP task returns to the event loop (at the start of every `bm_events_receive()` and at the end of `bm_events_service()`), for an extension that hands work over to its own task once a listener is done (Slate delivers the scene changes there).
+- Added: `bm_events_watch()` and `bm_events_unwatch()` in the C API: a C listener of one event class, run before the PHP listeners and never frozen, for an extension that reacts to events without a PHP callable.
+- Changed: a delivery no longer runs the PHP listeners of an event when an exception is already pending (a C watch that threw, for example): the exception propagates as one from a listener would.
+- Added: bm_hal_task_start(), bm_hal_alloc() and bm_hal_free() in the events HAL contract (events-hal 1.5), for packages that need their own task, or internal and external RAM (BM_HAL_MEM_INTERNAL, BM_HAL_MEM_EXTERNAL, BM_HAL_MEM_EXTERNAL_ONLY), without ESP-IDF. Requires php-baremetal/events-hal ^1.5.
+
 ## 1.1.0
 
 - Added: ide/ext-events.stub, the PHP declarations of the package for IDEs (conductor copies it into vendor/php-baremetal/ide-stubs/).

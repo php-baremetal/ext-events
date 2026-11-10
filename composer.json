@@ -8,7 +8,7 @@
     ],
     "require": {
         "php": ">=8.3",
-        "php-baremetal/events-hal": "^1.4"
+        "php-baremetal/events-hal": "^1.5"
     },
     "extra": {
         "baremetal": {

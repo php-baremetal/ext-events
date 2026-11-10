@@ -87,6 +87,18 @@ Used by `ext-web` and its HAL; another server-style source can use them the same
 | `void bm_events_service(void)` | A runtime that never delivers events (`init-loop`), once per loop inside `phpbm_invoke()`: gives the slots of waiting events back, runs object releases, answers HTTP requests 503, prints the pending warnings. The SDK declares it weak, so a firmware without ext-events still links. |
 | `void bm_events_freeze(void)`, `void bm_events_power_autorelease(void)` | The `event-driven` runtime: freeze the listener table; release any `power_hold()` left. |
 
+### Back in the loop, and C listeners (since 1.2)
+
+| Function | Use |
+| --- | --- |
+| `bool bm_events_on_idle(void (*cb)(void *arg), void *arg)` | PHP task. `cb(arg)` runs each time the PHP task returns to the event loop: at the start of every `bm_events_receive()` (after each delivered message, before the reactor takes the next one or waits) and at the end of `bm_events_service()` (`init-loop`, after each `loop()`). It runs outside any PHP frame: plain C only, short, no PHP calls. At most 4 hooks; false when the table is full. |
+| `void bm_events_off_idle(void (*cb)(void *arg), void *arg)` | PHP task. Removes the hook. |
+| `bool bm_events_watch(zend_class_entry *ce, bm_events_watch_fn fn, void *arg)` | PHP task. `fn(event, arg)` (`void (*)(zend_object *event, void *arg)`) runs for every delivered event of exactly class `ce`, before its PHP listeners, inside the delivery frame (it may call PHP; an exception stops the delivery as a listener's would). Never frozen; it stays until removed. At most 8 watches; false when the table is full. |
+| `void bm_events_unwatch(zend_class_entry *ce, bm_events_watch_fn fn, void *arg)` | PHP task. Removes the watch. |
+
+The runtimes need no change for these: the `event-driven` reactor calls `bm_events_receive()` after every
+message, and `init-loop` calls `bm_events_service()` after every `loop()`.
+
 ## The events HAL
 
 `bm_events_hal.h` is what a platform implements to provide `php-baremetal/events-hal`:
@@ -99,6 +111,8 @@ Used by `ext-web` and its HAL; another server-style source can use them the same
 | GPIO | `bm_hal_gpio_input()` (`BM_HAL_PULL_UP` / `_DOWN` / `_NONE`), `bm_hal_gpio_level()`, `bm_hal_gpio_on_falling()`, `bm_hal_gpio_off()` (detach the pin's interrupt, the pin stays an input; interface version 1.4, used by `GpioWatch::stop()`) |
 | Power | `bm_hal_power_save()`, `bm_hal_pmlock_create()` (NULL when power management is off), `bm_hal_pmlock_acquire()`, `bm_hal_pmlock_release()` |
 | Lock | `bm_hal_lock_create()`, `bm_hal_lock_enter()`, `bm_hal_lock_exit()`: a short, non-recursive critical section usable from a task and from an ISR (a spinlock on ESP32, a mutex on the PC). Interface version 1.3 |
+| Task | `bm_hal_task_start(fn, arg, name, stack, priority, core)`: runs `fn(arg)` in a new task that ends by itself when `fn` returns, for a package that needs its own task without the platform headers. `stack` in bytes, `priority` relative to the PHP task (0 = same, +1 above, -1 below), `core` a `bm_hal_core_t` (`BM_HAL_CORE_ANY`, `BM_HAL_CORE_0`, `BM_HAL_CORE_1`); false when it cannot start. Call it from the PHP task. Interface version 1.5 |
+| Memory | `bm_hal_alloc(bytes, where)` and `bm_hal_free(p)`: `where` is `BM_HAL_MEM_INTERNAL` (fast internal RAM) or `BM_HAL_MEM_EXTERNAL` (external RAM such as PSRAM when the board has it, otherwise internal RAM) or `BM_HAL_MEM_EXTERNAL_ONLY` (external RAM or NULL, for optional memory that must not take internal RAM); NULL when there is no memory; `bm_hal_free(NULL)` does nothing. Any task, not an ISR. Interface version 1.5 |
 | Runtime | `bm_hal_request_scoped()`: true when every HTTP request is its own PHP request (`web-server`), for the whole run; event sources are refused then. Interface version 1.1 |
 
 ## The event core

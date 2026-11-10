@@ -1,5 +1,5 @@
 <?php
-// php-baremetal/ext-events 1.1.0 — IDE helper, not loaded at runtime.
+// php-baremetal/ext-events 1.2.0 — IDE helper, not loaded at runtime.
 
 namespace Baremetal {
     /**

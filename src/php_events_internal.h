@@ -103,6 +103,8 @@ void bm_event_set_time(zend_object *obj, zend_class_entry *ce, int64_t us);
 
 /* Delivers to the exact-class listeners. */
 void bm_deliver(zval *event);
+/* The hooks of bm_events_on_idle(), in table order (bm_events_receive(), bm_events_service()). */
+void bm_run_idle(void);
 
 /* Object releases whose messages have all been read. */
 void bm_release_due(void);

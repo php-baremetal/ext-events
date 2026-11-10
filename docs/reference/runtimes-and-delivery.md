@@ -110,6 +110,10 @@ events HAL, `bm_hal_request_scoped()`). For HTTP with resident state and sources
   event (nested `now()` and dispatched events included) is released. Pending warnings are printed. Every 256 events the garbage collector runs.
 <!-- @endsteps -->
 
+Before it takes the next message (or waits), the reactor runs the C hooks that packages registered with
+`bm_events_on_idle()`: that is where work prepared by a listener is handed over to a package's own task, for
+example the scene changes of Slate. `init-loop` runs the same hooks after each `loop()`.
+
 If the queue cannot be created, the runtime prints `phpbm: cannot create the event queue` and the program
 ends.
 

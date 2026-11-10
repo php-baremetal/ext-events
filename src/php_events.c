@@ -45,10 +45,99 @@ void bm_events_freeze(void)
     bm_frozen = true;
 }
 
-/* Exact-class listeners; a false return stops the chain. */
+/* ---- C watches (bm_events_watch) and idle hooks (bm_events_on_idle): process-wide, PHP task only ---- */
+
+#define BM_WATCH_MAX 8
+#define BM_IDLE_MAX  4
+
+static struct { zend_class_entry *ce; bm_events_watch_fn fn; void *arg; } bm_watch[BM_WATCH_MAX];
+static struct { void (*cb)(void *arg); void *arg; } bm_idle[BM_IDLE_MAX];
+
+bool bm_events_watch(zend_class_entry *ce, bm_events_watch_fn fn, void *arg)
+{
+    int free_i = -1;
+    for (int i = 0; i < BM_WATCH_MAX; i++) {
+        if (bm_watch[i].fn == fn && bm_watch[i].ce == ce && bm_watch[i].arg == arg) {
+            return true;
+        }
+        if (!bm_watch[i].fn && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (!ce || !fn || free_i < 0) {
+        return false;
+    }
+    bm_watch[free_i].ce = ce;
+    bm_watch[free_i].fn = fn;
+    bm_watch[free_i].arg = arg;
+    return true;
+}
+
+void bm_events_unwatch(zend_class_entry *ce, bm_events_watch_fn fn, void *arg)
+{
+    for (int i = 0; i < BM_WATCH_MAX; i++) {
+        if (bm_watch[i].fn == fn && bm_watch[i].ce == ce && bm_watch[i].arg == arg) {
+            bm_watch[i].fn = NULL;
+            bm_watch[i].ce = NULL;
+            bm_watch[i].arg = NULL;
+        }
+    }
+}
+
+bool bm_events_on_idle(void (*cb)(void *arg), void *arg)
+{
+    int free_i = -1;
+    for (int i = 0; i < BM_IDLE_MAX; i++) {
+        if (bm_idle[i].cb == cb && bm_idle[i].arg == arg) {
+            return true;
+        }
+        if (!bm_idle[i].cb && free_i < 0) {
+            free_i = i;
+        }
+    }
+    if (!cb || free_i < 0) {
+        return false;
+    }
+    bm_idle[free_i].cb = cb;
+    bm_idle[free_i].arg = arg;
+    return true;
+}
+
+void bm_events_off_idle(void (*cb)(void *arg), void *arg)
+{
+    for (int i = 0; i < BM_IDLE_MAX; i++) {
+        if (bm_idle[i].cb == cb && bm_idle[i].arg == arg) {
+            bm_idle[i].cb = NULL;
+            bm_idle[i].arg = NULL;
+        }
+    }
+}
+
+void bm_run_idle(void)
+{
+    for (int i = 0; i < BM_IDLE_MAX; i++) {
+        if (bm_idle[i].cb) {
+            bm_idle[i].cb(bm_idle[i].arg);
+        }
+    }
+}
+
+/* The watches of the event's class, in table order; an exception stops them. */
+static void bm_run_watches(zval *event)
+{
+    zend_class_entry *ce = Z_OBJCE_P(event);
+    for (int i = 0; i < BM_WATCH_MAX && !EG(exception); i++) {
+        if (bm_watch[i].fn && bm_watch[i].ce == ce) {
+            bm_watch[i].fn(Z_OBJ_P(event), bm_watch[i].arg);
+        }
+    }
+}
+
+/* C watches, then the exact-class listeners; a false return stops the chain. */
 void bm_deliver(zval *event)
 {
-    if (!bm_ready) {
+    bm_run_watches(event);
+    if (!bm_ready || EG(exception)) {
         return;
     }
     zval *list = zend_hash_find(&bm_listeners, Z_OBJCE_P(event)->name);
@@ -649,6 +738,8 @@ PHP_MINIT_FUNCTION(events)
 
 PHP_MSHUTDOWN_FUNCTION(events)
 {
+    memset(bm_watch, 0, sizeof bm_watch);
+    memset(bm_idle, 0, sizeof bm_idle);
     bm_classes_shutdown();
     bm_source_shutdown();
     return SUCCESS;

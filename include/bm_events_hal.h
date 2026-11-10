@@ -54,6 +54,26 @@ void bm_hal_gpio_on_falling(int pin, void (*isr)(void *arg), void *arg);
 /* Detach the pin's interrupt (the handler set by bm_hal_gpio_on_falling()); the pin stays an input. Called from the PHP task. */
 void bm_hal_gpio_off(int pin);
 
+/* Own task (since events-hal 1.5), for a package that needs to run work beside the PHP task without the
+ * platform's headers. Where the task runs: BM_HAL_CORE_ANY lets the platform pick, 0 and 1 pin it. */
+typedef enum { BM_HAL_CORE_ANY = -1, BM_HAL_CORE_0 = 0, BM_HAL_CORE_1 = 1 } bm_hal_core_t;
+
+/* Starts fn(arg) in a new task that runs until fn returns (the task then ends by itself and keeps nothing).
+ * stack in bytes; priority relative to the PHP task (0 = same, +1 above, -1 below); core: where it runs. false when
+ * it cannot start (fn NULL, out of memory). PHP task only. */
+bool bm_hal_task_start(void (*fn)(void *arg), void *arg, const char *name, uint32_t stack, int priority,
+                       bm_hal_core_t core);
+
+/* Memory by kind (since events-hal 1.5), for a package that sizes big buffers without the platform's headers.
+ * BM_HAL_MEM_INTERNAL: fast internal RAM; BM_HAL_MEM_EXTERNAL: external RAM (PSRAM) when the board has it, else
+ * internal RAM; BM_HAL_MEM_EXTERNAL_ONLY: external RAM or nothing (NULL on a board without it, or with it full),
+ * for optional memory that must not take internal RAM. Blocks are aligned for any type; NULL when there is no
+ * memory. bm_hal_free() takes a block of bm_hal_alloc() (NULL allowed). Both callable from any task (not from an
+ * ISR). */
+typedef enum { BM_HAL_MEM_INTERNAL = 0, BM_HAL_MEM_EXTERNAL = 1, BM_HAL_MEM_EXTERNAL_ONLY = 2 } bm_hal_mem_t;
+void *bm_hal_alloc(size_t bytes, bm_hal_mem_t where);
+void bm_hal_free(void *p);
+
 /* Whether automatic light sleep is on (the host configured esp_pm). */
 bool bm_hal_power_save(void);
 

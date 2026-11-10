@@ -454,7 +454,7 @@ void bm_release_request_end(void)
 
 /* ---- the reactor side ---- */
 
-bool bm_events_receive(bm_event_msg_t *out, uint32_t ms)
+static bool bm_receive(bm_event_msg_t *out, uint32_t ms)
 {
     evt_t *e;
     if (!bm_queue || !bm_hal_queue_receive(bm_queue, &e, ms)) {
@@ -466,6 +466,12 @@ bool bm_events_receive(bm_event_msg_t *out, uint32_t ms)
     out->ptr  = ((bm_payload_t *) e->payload)->ptr;
     out->slot = e;
     return true;
+}
+
+bool bm_events_receive(bm_event_msg_t *out, uint32_t ms)
+{
+    bm_run_idle();   /* back in the loop: the hooks of bm_events_on_idle() */
+    return bm_receive(out, ms);
 }
 
 static void bm_deliver_http(void *handle)
@@ -561,9 +567,10 @@ void bm_events_deliver_msg(const bm_event_msg_t *msg)
 void bm_events_service(void)
 {
     bm_event_msg_t msg;
-    while (bm_events_receive(&msg, 0)) {
+    while (bm_receive(&msg, 0)) {   /* the idle hooks run once, at the end */
         bm_discard(msg.slot, msg.kind, msg.ptr);
     }
     bm_release_due();
     bm_flush_warnings();
+    bm_run_idle();
 }

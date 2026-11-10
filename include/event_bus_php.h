@@ -38,6 +38,25 @@ void bm_events_freeze(void);
 #define BM_EVT_DISPATCH 4
 typedef struct { uint16_t tag; uint8_t kind; void *ptr; void *slot; } bm_event_msg_t;
 
+/* Since 1.2: C work that must run each time the PHP task returns to the event loop (Slate hands over the scene
+ * changes a listener made). cb(arg) runs on the PHP task at the start of every bm_events_receive() (so after each
+ * delivered message, before the reactor takes the next one or waits) and once at the end of bm_events_service()
+ * (init-loop, after each loop()). It runs outside any PHP frame: plain C only, no PHP calls, no exceptions, short.
+ * At most 4 hooks; the same (cb, arg) twice is kept once. False when the table is full. PHP task only. */
+bool bm_events_on_idle(void (*cb)(void *arg), void *arg);
+/* Removes a hook of bm_events_on_idle() (no-op when absent). PHP task only. */
+void bm_events_off_idle(void (*cb)(void *arg), void *arg);
+
+/* Since 1.2: a C listener of one event class (exact class, as Events::listen()), for an extension that reacts to
+ * events without a PHP callable. fn(event, arg) runs on the PHP task before the PHP listeners of the class, in the
+ * delivery frame (it may call PHP; an exception it leaves stops the delivery like a listener's). Unlike
+ * Events::listen() it is never frozen, and it stays until bm_events_unwatch(). At most 8 watches; the same
+ * (ce, fn, arg) twice is kept once. False when the table is full. PHP task only. */
+typedef void (*bm_events_watch_fn)(struct _zend_object *event, void *arg);
+bool bm_events_watch(struct _zend_class_entry *ce, bm_events_watch_fn fn, void *arg);
+/* Removes a watch of bm_events_watch() (no-op when absent). PHP task only. */
+void bm_events_unwatch(struct _zend_class_entry *ce, bm_events_watch_fn fn, void *arg);
+
 /* UINT32_MAX = forever. False on timeout or no queue. */
 bool bm_events_receive(bm_event_msg_t *out, uint32_t ms);
 
